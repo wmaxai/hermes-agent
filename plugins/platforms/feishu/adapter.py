@@ -219,6 +219,10 @@ _FEISHU_DOC_UPLOAD_TYPES = {
 _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
 _FEISHU_SEND_ATTEMPTS = 3
+# Worker cap for the adapter-owned websocket pool (see _get_ws_executor). Only
+# one worker is ever held by the long-lived WS client; the rest is headroom for
+# a reconnect that starts while the previous (wedged) client thread has exited.
+_FEISHU_WS_POOL_SIZE = 4
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
@@ -1604,6 +1608,10 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_client: Optional[Any] = None
         self._ws_future: Optional[asyncio.Future] = None
         self._ws_supervisor: Optional[asyncio.Task] = None
+        # Adapter-owned pool hosting the long-lived official Feishu WS client;
+        # NEVER submitted to the loop default executor (see _get_ws_executor).
+        self._ws_executor_lock = threading.Lock()
+        self._ws_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._ws_restart_backoff = 5.0
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1871,6 +1879,54 @@ class FeishuAdapter(BasePlatformAdapter):
         except TypeError:
             executor.shutdown(wait=False)
 
+    def _get_ws_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Return the adapter-owned pool that hosts the long-lived Feishu WS client.
+
+        ``_run_official_feishu_ws_client`` runs a private event loop via
+        ``run_forever()`` for the whole connection lifetime, so it pins one
+        worker permanently. Submitting it to the loop's *default* executor
+        therefore burns ``min(32, cpu + 4)`` shared threads one app at a time;
+        on a 2-core host (6 workers) the 7th multiplexed Feishu app's
+        ``connect()`` can no longer obtain a default-executor thread for its
+        ``asyncio.to_thread`` startup calls and the whole gateway deadlocks
+        during startup (the 09-03 boot hang). Hosting each client on a small
+        adapter-owned pool keeps the default executor free. Created lazily and
+        rebuilt after teardown so a reconnect is never wedged by a dead pool.
+        """
+        lock = getattr(self, "_ws_executor_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._ws_executor_lock = lock
+        with lock:
+            executor = getattr(self, "_ws_executor", None)
+            if executor is None or getattr(executor, "_shutdown", False):
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_FEISHU_WS_POOL_SIZE,
+                    thread_name_prefix="hermes-feishu-ws",
+                )
+                self._ws_executor = executor
+            return executor
+
+    def _shutdown_ws_executor(self) -> None:
+        """Release the adapter-owned WS pool without blocking on a wedged thread.
+
+        ``wait=False`` keeps disconnect() bounded — blocking teardown on a
+        websocket thread that already stopped responding is what trips the
+        shutdown watchdog.
+        """
+        lock = getattr(self, "_ws_executor_lock", None)
+        if lock is None:
+            return
+        with lock:
+            executor = getattr(self, "_ws_executor", None)
+            self._ws_executor = None
+        if executor is None:
+            return
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Feishu/Lark."""
         # A fresh connect (or reconnect) re-arms the SDK executor after a prior
@@ -2015,6 +2071,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._loop = None
         self._event_handler = None
         self._shutdown_sdk_executor()
+        self._shutdown_ws_executor()
         self._persist_seen_message_ids()
         await self._release_app_lock()
 
@@ -5145,7 +5202,7 @@ class FeishuAdapter(BasePlatformAdapter):
             extra_ua_tags=["channel"],
         )
         self._ws_future = loop.run_in_executor(
-            None,
+            self._get_ws_executor(),
             _run_official_feishu_ws_client,
             self._ws_client,
             self,
