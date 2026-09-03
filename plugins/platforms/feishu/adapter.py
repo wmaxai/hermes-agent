@@ -2293,6 +2293,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         "tag": "action",
                         "actions": actions,
                     },
+                    {"tag": "markdown", "content": _t("approval.card_howto_reply")},
                 ],
             }
 

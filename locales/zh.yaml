@@ -30,6 +30,7 @@ approval:
   card_resolved_session: "本会话已允许"
   card_resolved_always: "已永久允许"
   card_resolved_deny: "已拒绝"
+  card_howto_reply: "\n文字回复同样有效：`/approve` 仅本次 · `/approve session` 本会话 · `/approve always` 永久 · `/deny` 拒绝"
 
 gateway:
   approval_expired: "⚠️ 批准已过期（代理不再等待）。请让代理重试。"

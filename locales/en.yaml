@@ -42,6 +42,7 @@ approval:
   card_resolved_session: "Approved for session"
   card_resolved_always: "Approved permanently"
   card_resolved_deny: "Denied"
+  card_howto_reply: "\nText reply also works: `/approve` once · `/approve session` this session · `/approve always` permanent · `/deny` reject"
 
 gateway:
   # Messenger replies to slash commands and implicit state changes.
