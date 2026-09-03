@@ -261,6 +261,19 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
 }
 
 
+def _t(key: str, **kwargs: Any) -> str:
+    """i18n lookup for approval-card strings (display.language aware).
+
+    Returns the bare key when the catalog cannot load; in a gateway process
+    agent.i18n is always importable, so this only guards standalone imports.
+    """
+    try:
+        from agent.i18n import t as _translate
+        return _translate(key, **kwargs)
+    except Exception:
+        return key
+
+
 async def _read_limited_feishu_webhook_body(request: Any, max_bytes: int) -> bytes:
     """Read at most ``max_bytes`` from an aiohttp request body."""
     try:
@@ -2219,9 +2232,17 @@ class FeishuAdapter(BasePlatformAdapter):
     # Template attrs for the shared _format_exec_approval core. The card
     # header carries the title, so the text core starts at the code fence.
     _EA_HEADER = ""
-    _EA_REASON_LABEL = "**Reason:** "
-    _EA_SMART_DENY_LINE = "\n\n**Smart DENY:** owner override applies to this one operation only."
     _EA_CMD_BUDGET = 3000
+
+    # Resolved at send time so ``display.language`` applies per message;
+    # the shared base assembly template stays untouched.
+    @property
+    def _EA_REASON_LABEL(self) -> str:
+        return _t("approval.card_reason_label")
+
+    @property
+    def _EA_SMART_DENY_LINE(self) -> str:
+        return _t("approval.card_smart_deny")
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
@@ -2251,16 +2272,16 @@ class FeishuAdapter(BasePlatformAdapter):
                     "value": {"hermes_action": action_name, "approval_id": approval_id},
                 }
 
-            actions = [_btn("✅ Allow Once", "approve_once", "primary")]
+            actions = [_btn(_t("approval.card_allow_once"), "approve_once", "primary")]
             if not smart_denied and allow_session:
-                actions.append(_btn("✅ Session", "approve_session"))
+                actions.append(_btn(_t("approval.card_allow_session"), "approve_session"))
                 if allow_permanent:
-                    actions.append(_btn("✅ Always", "approve_always"))
-            actions.append(_btn("❌ Deny", "deny", "danger"))
+                    actions.append(_btn(_t("approval.card_allow_always"), "approve_always"))
+            actions.append(_btn(_t("approval.card_deny"), "deny", "danger"))
             card = {
                 "config": {"wide_screen_mode": True},
                 "header": {
-                    "title": {"content": "⚠️ Command Approval Required", "tag": "plain_text"},
+                    "title": {"content": _t("approval.card_title"), "tag": "plain_text"},
                     "template": "orange",
                 },
                 "elements": [
@@ -2368,7 +2389,9 @@ class FeishuAdapter(BasePlatformAdapter):
     def _build_resolved_approval_card(*, choice: str, user_name: str) -> Dict[str, Any]:
         """Build raw card JSON for a resolved approval action."""
         icon = "❌" if choice == "deny" else "✅"
-        label = _APPROVAL_LABEL_MAP.get(choice, "Resolved")
+        label = _t(f"approval.card_resolved_{choice}")
+        if label.startswith("approval."):
+            label = _APPROVAL_LABEL_MAP.get(choice, _t("approval.card_resolved"))
         return {
             "config": {"wide_screen_mode": True},
             "header": {

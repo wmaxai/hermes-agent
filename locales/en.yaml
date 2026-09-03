@@ -28,6 +28,20 @@ approval:
   denied:          "      ✗ Denied"
   cancelled:       "      ✗ Cancelled"
   blocklist_message: "This command is on the unconditional blocklist and cannot be approved."
+  # Interactive-card approval strings (feishu et al.; English is the fallback
+  # language every catalog misses resolve to).
+  card_title: "⚠️ Command Approval Required"
+  card_allow_once: "✅ Allow Once"
+  card_allow_session: "✅ Session"
+  card_allow_always: "✅ Always"
+  card_deny: "❌ Deny"
+  card_reason_label: "**Reason:** "
+  card_smart_deny: "\n\n**Smart DENY:** owner override applies to this one operation only."
+  card_resolved: "Resolved"
+  card_resolved_once: "Approved once"
+  card_resolved_session: "Approved for session"
+  card_resolved_always: "Approved permanently"
+  card_resolved_deny: "Denied"
 
 gateway:
   # Messenger replies to slash commands and implicit state changes.
