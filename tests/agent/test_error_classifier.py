@@ -642,6 +642,26 @@ class TestClassifyApiError:
         assert result.should_fallback is True
         assert result.should_compress is False
 
+    def test_dashscope_data_inspection_content_policy_blocked(self):
+        # Alibaba Cloud DashScope runs the replayed conversation history
+        # through an input content inspection stage; a long-lived session
+        # carrying one flagged turn fails EVERY subsequent request
+        # deterministically with this 400. Without the pattern it falls into
+        # the generic non-retryable / context-overflow path and users see the
+        # misleading "model provider failed after retries" instead of the
+        # provider-block explanation with fallback guidance.
+        e = MockAPIError(
+            "Error code: 400 - {'error': {'message': '<400> "
+            "InternalError.Algo.DataInspectionFailed: Input text data may "
+            "contain inappropriate content.', 'type': 'data_inspection_failed', "
+            "'param': None, 'code': 'data_inspection_failed'}}",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="alibaba", model="qwen3.8-flash")
+        assert result.reason == FailoverReason.content_policy_blocked
+        assert result.retryable is False
+        assert result.should_fallback is True
+
 
 
 

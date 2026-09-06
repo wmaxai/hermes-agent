@@ -625,6 +625,17 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = [
     # filter name and is narrow enough that billing / format / auth error
     # strings will not collide. See #32421.
     "new_sensitive",
+    # Alibaba Cloud DashScope input content inspection. Long-lived sessions
+    # can carry a turn that trips DashScope's DataInspection on the *replayed
+    # history*, so every subsequent request fails deterministically with
+    # HTTP 400 "InternalError.Algo.DataInspectionFailed: Input text data may
+    # contain inappropriate content" (error type/code
+    # ``data_inspection_failed``). Without this pattern the 400 falls through
+    # to the generic non-retryable/context-overflow path and users see the
+    # misleading "model provider failed after retries" message instead of a
+    # provider-block explanation with fallback guidance.
+    "data_inspection_failed",
+    "datainspectionfailed",
 ]
 
 # Auth patterns (non-status-code signals)
