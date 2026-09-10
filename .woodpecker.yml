@@ -1,0 +1,53 @@
+# Woodpecker CI —— hermes-agent（wmaxai fork，stable 部署线）
+#
+# 定位：只做【生产镜像发布】。不跑单测：本项目测试需要完整依赖树与 16 profile
+#      运行环境，不适合 CI；构建镜像本身（uv sync 8 个 extra + npm + Playwright
+#      Chromium + web/ui-tui 前端构建）已是最强的一致性校验。
+#
+# 触发：仅 stable 分支手动 Run（event=manual；其它分支/事件匹配不到）
+# 产出：registry.group.wmaxai.team/hermes-agent:stable-<commit 短 id>
+# 部署：不做自动部署。推送成功后人工取 digest 更新 k8s（与 fns 同流程）：
+#       kubectl -n <ns> set image deploy/<hermes 部署名> \
+#         hermes=registry.group.wmaxai.team/hermes-agent@sha256:<digest>
+# 凭据：registry_username / registry_password（Woodpecker 组织级 Secrets，与 fns 共用）
+#
+# ⚠️ 两个前置条件在 Woodpecker UI 侧，不在本文件里：
+#   1. 项目 Timeout 调到 120 分钟（默认 60m）——本镜像构建很重：SQLite 源码编译
+#      + uv sync（all/messaging/otlp/anthropic/bedrock/azure/hindsight/matrix）
+#      + npm + Playwright Chromium + 前端构建。官方 CI 15–45 分钟，2C4G 自建
+#      runner 40–70 分钟。（上限受 server 端 WOODPECKER_MAX_PIPELINE_TIMEOUT
+#      约束，默认 120m —— 若被拒，需先在 server 侧调大。）
+#   2. 组织 Secrets 里已有 registry_username / registry_password
+#
+# 镜像 provenance：Dockerfile 的 ARG HERMES_GIT_SHA 会写入
+# /opt/hermes/.hermes_build_sha 与 /etc/hermes/image-provenance.json。
+# .dockerignore 排除了 .git，所以不传这个 arg 的话镜像里 `hermes dump` 只会显示
+# unknown，出问题无法定位是哪个 commit 构建的——故必须传。
+
+when:
+  event: manual
+  branch: stable
+
+clone:
+  - name: clone
+    image: woodpeckerci/plugin-git
+    settings:
+      # .dockerignore 排除 .git，镜像 provenance 走 HERMES_GIT_SHA build-arg，
+      # 构建不需要任何历史；本仓库 .git 有 1.2G，depth 1 省掉全量 clone。
+      depth: 1
+
+steps:
+  - name: build-and-push
+    image: woodpeckerci/plugin-docker-buildx:2
+    settings:
+      registry: https://registry.group.wmaxai.team
+      repo: registry.group.wmaxai.team/hermes-agent
+      dockerfile: Dockerfile
+      tags: stable-${CI_COMMIT_SHA:0:8}
+      platforms: linux/amd64
+      build_args:
+        HERMES_GIT_SHA: "${CI_COMMIT_SHA}"
+      username:
+        from_secret: registry_username
+      password:
+        from_secret: registry_password
