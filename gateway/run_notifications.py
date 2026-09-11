@@ -30,6 +30,21 @@ _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
 _WATCHER_ROUTE_FIELDS = ("session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id", "user_name")
 _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 
+# Bounded retries for a watch notification the adapter never admits. Requeueing such an event forever
+# spins the notification drain tick and floods the log with the same drop warning (#104767 follow-up).
+_MAX_WATCH_INJECT_ATTEMPTS = 5
+
+
+def _session_key_profile_name(session_key: str) -> Optional[str]:
+    """Profile namespace declared by an ``agent:<profile>:...`` key (None = primary/default lane)."""
+    parts = str(session_key or "").strip().split(":")
+    if len(parts) >= 5 and parts[0] == "agent":
+        name = parts[1].strip()
+        if name and name != "main":
+            return name
+    return None
+
+
 # Durable async-delegation claim transitions: kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
     "drop": ("drop_completion_delivery", "Could not drop durable completion claim"),
@@ -815,6 +830,16 @@ class GatewayNotificationsMixin:
             )
 
     def _build_process_event_source(self, evt: dict):
+        """Canonical source for a synthetic background-process event, re-homed to its session key.
+
+        A stored origin's ``profile`` can be stale (the chat was re-homed to another multiplex
+        profile after the origin was written) and then contradicts the queued ``agent:<p>:...`` key —
+        see :meth:`_reconcile_process_event_source_profile`.
+        """
+        return self._reconcile_process_event_source_profile(
+            self._unreconciled_process_event_source(evt), evt)
+
+    def _unreconciled_process_event_source(self, evt: dict):
         """Resolve the canonical source for a synthetic background-process event.
 
         Prefer the persisted session-store origin; the active foreground event causes cross-topic bleed.
@@ -882,6 +907,36 @@ class GatewayNotificationsMixin:
             user_id=_opt("user_id"), user_name=_opt("user_name"), scope_id=scope_id, profile=profile,
         )
 
+    @staticmethod
+    def _reconcile_process_event_source_profile(source, evt: dict):
+        """Re-home a synthetic event source whose stored ``profile`` contradicts its session key.
+
+        The queued ``agent:<profile>:...`` key is authoritative: the receiving adapter derives its
+        session key from ``source.profile`` (falling back to that adapter's owner profile), and
+        ``handle_message`` drops any internally routed event whose derived key differs from the
+        queued ``gateway_session_key``. A stale persisted origin (chat re-homed to another multiplex
+        profile) therefore injects through the WRONG profile's adapter, and that drop requeues the
+        watch event forever — one log line and one adapter round-trip every drain tick.
+
+        Returns a copy (the persisted origin object is shared, never mutated here).
+        """
+        if source is None:
+            return None
+        want = _session_key_profile_name(evt.get("session_key"))
+        have = (getattr(source, "profile", None) or "").strip() or None
+        if want == have or (want is None and have == "default"):
+            return source
+        try:
+            fixed = dataclasses.replace(source, profile=want)
+        except Exception:
+            logger.debug("Could not re-home synthetic event source profile", exc_info=True)
+            return source
+        logger.warning(
+            "Re-homed synthetic event source profile %r → %r for session %s (stale stored origin)",
+            have, want, evt.get("session_key") or "?",
+        )
+        return fixed
+
     async def _drain_watch_notifications(self, completion_queue) -> None:
         """Consume queued watch events and inject them when notifications are enabled.
 
@@ -904,7 +959,17 @@ class GatewayNotificationsMixin:
                 logger.exception("Watch notification injection error")
                 delivered = False
             if delivered is False:
-                completion_queue.put(evt)
+                attempts = int(evt.get("_watch_inject_attempts") or 0) + 1
+                evt["_watch_inject_attempts"] = attempts
+                if attempts >= _MAX_WATCH_INJECT_ATTEMPTS:
+                    logger.warning(
+                        "Dropping watch notification for session %s after %d failed injections "
+                        "(type=%s) — refusing to requeue-spin",
+                        evt.get("session_key") or evt.get("session_id") or "unknown",
+                        attempts, evt.get("type", "?"),
+                    )
+                else:
+                    completion_queue.put(evt)
 
     def _adapter_by_platform_value(self, platform_name: str):
         """Literal ``p.value == platform_name`` scan over connected adapters (native adapters only)."""
