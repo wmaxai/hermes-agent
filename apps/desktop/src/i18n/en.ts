@@ -705,6 +705,10 @@ export const en: Translations = {
       tabStripAuto: 'Auto',
       tabStripAlways: 'Always',
       tabStripNever: 'Never',
+      appActionsTitle: 'App Actions',
+      appActionsDesc: 'Where Settings, Layout, and HUD sit in the titlebar. Right leaves room for tabs on the left.',
+      appActionsLeft: 'Left',
+      appActionsRight: 'Right',
       terminalFontTitle: 'Terminal Font',
       terminalFontDesc:
         'Choose an installed font for Desktop terminals. Nerd Fonts render Powerlevel10k and shell icons; leave blank to use bundled JetBrains Mono.',
@@ -4236,6 +4240,9 @@ export const en: Translations = {
     resumeStrandedTitle: "Couldn't load this session",
     resumeStrandedBody:
       'The connection to this session failed and automatic retries gave up. Check that the gateway is running, then try again.',
+    poolSlotTimeoutBody:
+      'All local profile backend slots are busy. Increase Warm Bot Backends in Settings → Advanced, or retry after an idle backend is evicted.',
+    poolSlotTimeoutOpenSettings: 'Open Advanced Settings',
     resumeRetry: 'Retry',
     nothingToBranch: 'Nothing to branch',
     branchNeedsChat: 'Start or resume a chat before branching.',
