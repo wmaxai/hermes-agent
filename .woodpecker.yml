@@ -67,6 +67,14 @@ steps:
       dockerfile: Dockerfile
       # tags_file 覆盖 tags：读取上一步写在工作区的 .tags（多行=多 tag）
       tags_file: .tags
+      # 构建缓存：plugin-docker-buildx 每次跑在一次性容器里，本地 cache 随容器销毁，
+      # 不导出的话每次都全量重建（SQLite 编译 + uv sync + npm + Chromium + 前端 = 40–70min）。
+      # 这里把缓存作为 registry 里的一个镜像存取（等价写法：cache_images: [<同一 ref>]，
+      # 插件会展开成本处的 cache_from/cache_to）。mode=max 才缓存多阶段的所有层；
+      # image-manifest/oci-mediatypes 是官方对 Harbor 这类 registry 的兼容建议。
+      # ⚠️ :buildcache 只是缓存，不可用于部署；部署仍用 stable-<sha8>-<版本> 或 digest。
+      cache_from: "type=registry,ref=registry.group.wmaxai.team/hermes-agent:buildcache"
+      cache_to: "type=registry,ref=registry.group.wmaxai.team/hermes-agent:buildcache,mode=max,image-manifest=true,oci-mediatypes=true"
       platforms: linux/amd64
       build_args:
         HERMES_GIT_SHA: "${CI_COMMIT_SHA}"
