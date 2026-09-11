@@ -75,6 +75,14 @@ steps:
       # ⚠️ :buildcache 只是缓存，不可用于部署；部署仍用 stable-<sha8>-<版本> 或 digest。
       cache_from: "type=registry,ref=registry.group.wmaxai.team/hermes-agent:buildcache"
       cache_to: "type=registry,ref=registry.group.wmaxai.team/hermes-agent:buildcache,mode=max,image-manifest=true,oci-mediatypes=true"
+      # 备选（想完全不占网络、或将来 registry 挪到公网/跨地域时）——本地持久目录缓存：
+      #   1) agent 侧允许挂载（WOODPECKER_BACKEND_DOCKER_VOLUMES 白名单）；
+      #   2) 本步骤加 volumes: [/var/cache/woodpecker/hermes-buildx:/cache]；
+      #   3) 上面两行换成：
+      #        cache_from: "type=local,src=/cache"
+      #        cache_to:   "type=local,dest=/cache,mode=max"
+      # 代价：缓存绑在这一台 agent 上（多 agent 各自一份、agent 重建即丢）。
+      # 现状：registry 是内网 10.3.4.15（实测 RTT≈1ms、TLS≈26ms），故用 registry 缓存。
       platforms: linux/amd64
       build_args:
         HERMES_GIT_SHA: "${CI_COMMIT_SHA}"
