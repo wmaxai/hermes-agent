@@ -28,6 +28,11 @@
 # /opt/hermes/.hermes_build_sha 与 /etc/hermes/image-provenance.json。
 # .dockerignore 排除了 .git，所以不传这个 arg 的话镜像里 `hermes dump` 只会显示
 # unknown，出问题无法定位是哪个 commit 构建的——故必须传。
+#
+# ⚠️ 本文件会被 Woodpecker 在【配置期】做整份文本替换（drone/envsubst），两条坑：
+#   1. 任何位置（包括注释）都不要出现「美元符号 + 花括号」的字面量写法，替换器会报
+#      unable to parse variable name，整条流水线直接生成失败；
+#   2. 命令里含「冒号 + 空格」时必须整条加引号，否则 YAML 把那行解析成 map。
 
 when:
   event: manual
@@ -45,31 +50,15 @@ clone:
       depth: 0
 
 steps:
-  # 算镜像 tag 并写进工作区 .tags（下一步 tags_file 读取）。
-  # fns 是在它自己的 build 步骤里算的；hermes 的 build 是 buildx 插件（没有 shell），
-  # 所以单列这一个只需要 git 的轻量步骤，镜像复用 clone 那一个（agent 上已拉取，无额外成本）。
+  # fns 是在自己的 build 步骤里算镜像 tag；hermes 的 build 是 buildx 插件（没有 shell），
+  # 所以单列一个与 clone 共用镜像的轻量步骤，命令与 fns 完全一致。
   - name: version-tag
     image: woodpeckerci/plugin-git
     commands:
-      # 版本 = 最近可达的 git tag（例：20260911），与 fns 完全一致的取法。
       - VERSION=$(git describe --tags --abbrev=0 2>/dev/null | tr '+' '-' || true)
-      # 短 sha 与 fns 同写法：`${CI_COMMIT_SHA:0:8}` 由 Woodpecker 在【配置期】替换成值
-      # （实测 drone/envsubst v1.0.3：`${CI_COMMIT_SHA:0:8}` → `abcdef12`，`:0:8` 子串语法可用）。
-      - SHA8=${CI_COMMIT_SHA:0:8}
-      # 兜底：配置期变量为空时（例如创建 manual pipeline 时 forge API 限流、拿不到 branch head，
-      # commit sha 为空 → setNonEmptyEnvVar 会跳过该变量）从工作区 HEAD 取，clone 出来的就是本次构建的 commit。
-      - '[ -n "$SHA8" ] || SHA8=$(git rev-parse HEAD | cut -c1-8)'
-      # 注意：这里**不能**写 `stable-${SHA8}...`——配置期替换会把未知变量 ${SHA8} 清空；
-      # 不带花括号的 $SHA8 才会留给运行时 shell（实测 drone/envsubst 只替换带花括号的变量引用；
-      # 反向注意：本文件里**不要**出现字面量“美元符号+花括号”的写法，连注释里都会让替换器报
-      # unable to parse variable name，整条流水线直接生成失败）。
-      - 'if [ -n "$VERSION" ]; then TAG="stable-$SHA8-$VERSION"; else TAG="stable-$SHA8"; fi'
+      - TAG="stable-${CI_COMMIT_SHA:0:8}${VERSION:+-$VERSION}"
       - echo "$TAG" > .tags
       - cat .tags
-      # 诊断（可删）：`$CI_COMMIT_SHA` 不带花括号 → 看运行时环境；`${CI_COMMIT_SHA}` 花括号 →
-      # 已被 Woodpecker 在配置期替换。两者都空就说明该 pipeline 没有 commit sha。
-      # 注意整条要用引号包起来：命令里有「冒号+空格」，不引会被 YAML 当成 map（配置直接解析失败）。
-      - 'echo "CI vars runtime_sha=[$CI_COMMIT_SHA] config_time_sha=[${CI_COMMIT_SHA}] branch=[$CI_COMMIT_BRANCH]"'
 
   - name: build-and-push
     image: woodpeckerci/plugin-docker-buildx:2
@@ -84,25 +73,11 @@ steps:
       dockerfile: Dockerfile
       # tags_file 覆盖 tags：读取上一步写在工作区的 .tags（多行=多 tag）
       tags_file: .tags
-      # 构建缓存：plugin-docker-buildx 每次跑在一次性容器里，本地 cache 随容器销毁，
-      # 不导出的话每次都全量重建（SQLite 编译 + uv sync + npm + Chromium + 前端 = 40–70min）。
-      # 这里把缓存作为 registry 里的一个镜像存取（等价写法：cache_images: [<同一 ref>]，
-      # 插件会展开成本处的 cache_from/cache_to）。mode=max 才缓存多阶段的所有层；
-      # image-manifest/oci-mediatypes 是官方对 Harbor 这类 registry 的兼容建议。
-      # ⚠️ :buildcache 只是缓存，不可用于部署；部署仍用 stable-<sha8>-<版本> 或 digest。
-      cache_from: "type=registry,ref=registry.group.wmaxai.team/hermes-agent:buildcache"
-      cache_to: "type=registry,ref=registry.group.wmaxai.team/hermes-agent:buildcache,mode=max,image-manifest=true,oci-mediatypes=true"
-      # 备选（想完全不占网络、或将来 registry 挪到公网/跨地域时）——本地持久目录缓存：
-      #   1) agent 侧允许挂载（WOODPECKER_BACKEND_DOCKER_VOLUMES 白名单）；
-      #   2) 本步骤加 volumes: [/var/cache/woodpecker/hermes-buildx:/cache]；
-      #   3) 上面两行换成：
-      #        cache_from: "type=local,src=/cache"
-      #        cache_to:   "type=local,dest=/cache,mode=max"
-      # 代价：缓存绑在这一台 agent 上（多 agent 各自一份、agent 重建即丢）。
-      # 现状：registry 是内网 10.3.4.15（实测 RTT≈1ms、TLS≈26ms），故用 registry 缓存。
       platforms: linux/amd64
+      # build_args 在插件 v2 里是 StringSlice，必须写成 KEY=VALUE 的列表项；
+      # 写成 map（HERMES_GIT_SHA: xxx）会被 Woodpecker JSON 编码成一整坨再传给 buildx，等于没传。
       build_args:
-        HERMES_GIT_SHA: "${CI_COMMIT_SHA}"
+        - HERMES_GIT_SHA=${CI_COMMIT_SHA}
       username:
         from_secret: registry_username
       password:
