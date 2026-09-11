@@ -1187,5 +1187,22 @@ def _resolve_node_runtime_npm() -> str | None:
 
 
 def _resolve_update_branch(args) -> str:
-    """Normalize ``args.branch`` to a non-empty name (default ``main``; blank/whitespace = default)."""
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    """Resolve the update target branch: ``--branch`` > ``HERMES_UPDATE_BRANCH`` > ``updates.branch``.
+
+    The built-in default stays ``main`` (upstream behaviour), but an install that ships from another
+    line can pin one: a fork whose deployment branch is ``stable`` must not let a plain
+    ``hermes update`` switch the checkout onto upstream main and drop every fork patch (that parked
+    this fleet on upstream code — gateway hung at 6/16 profiles — on 2026-09-11).
+    ``~/.hermes/.env`` is loaded by both the CLI and the gateway, so ``HERMES_UPDATE_BRANCH=stable``
+    there covers manual runs and gateway-spawned ``/update`` alike.
+    """
+    for candidate in (getattr(args, "branch", None), os.environ.get("HERMES_UPDATE_BRANCH")):
+        name = (candidate or "").strip()
+        if name:
+            return name
+    try:
+        from hermes_cli.update_cmd import _updates_config
+        configured = str((_updates_config() or {}).get("branch") or "").strip()
+    except Exception:
+        configured = ""
+    return configured or "main"
