@@ -53,12 +53,23 @@ steps:
     commands:
       # 版本 = 最近可达的 git tag（例：20260911），与 fns 完全一致的取法。
       - VERSION=$(git describe --tags --abbrev=0 2>/dev/null | tr '+' '-' || true)
-      # sha 直接从工作区取，而不是 `${CI_COMMIT_SHA:0:8}`：manual 事件下 CI_COMMIT_SHA 可能是
-      # 空的（实测跑出过 `stable--0.21.1`），而 clone 出来的 HEAD 就是本次构建的 commit。
-      - SHA8=$(git rev-parse HEAD | cut -c1-8)
-      - TAG="stable-${SHA8}${VERSION:+-$VERSION}"
+      # 短 sha 与 fns 同写法：`${CI_COMMIT_SHA:0:8}` 由 Woodpecker 在【配置期】替换成值
+      # （实测 drone/envsubst v1.0.3：`${CI_COMMIT_SHA:0:8}` → `abcdef12`，`:0:8` 子串语法可用）。
+      - SHA8=${CI_COMMIT_SHA:0:8}
+      # 兜底：配置期变量为空时（例如创建 manual pipeline 时 forge API 限流、拿不到 branch head，
+      # commit sha 为空 → setNonEmptyEnvVar 会跳过该变量）从工作区 HEAD 取，clone 出来的就是本次构建的 commit。
+      - '[ -n "$SHA8" ] || SHA8=$(git rev-parse HEAD | cut -c1-8)'
+      # 注意：这里**不能**写 `stable-${SHA8}...`——配置期替换会把未知变量 ${SHA8} 清空；
+      # 不带花括号的 $SHA8 才会留给运行时 shell（实测 drone/envsubst 只替换带花括号的变量引用；
+      # 反向注意：本文件里**不要**出现字面量“美元符号+花括号”的写法，连注释里都会让替换器报
+      # unable to parse variable name，整条流水线直接生成失败）。
+      - 'if [ -n "$VERSION" ]; then TAG="stable-$SHA8-$VERSION"; else TAG="stable-$SHA8"; fi'
       - echo "$TAG" > .tags
       - cat .tags
+      # 诊断（可删）：`$CI_COMMIT_SHA` 不带花括号 → 看运行时环境；`${CI_COMMIT_SHA}` 花括号 →
+      # 已被 Woodpecker 在配置期替换。两者都空就说明该 pipeline 没有 commit sha。
+      # 注意整条要用引号包起来：命令里有「冒号+空格」，不引会被 YAML 当成 map（配置直接解析失败）。
+      - 'echo "CI vars runtime_sha=[$CI_COMMIT_SHA] config_time_sha=[${CI_COMMIT_SHA}] branch=[$CI_COMMIT_BRANCH]"'
 
   - name: build-and-push
     image: woodpeckerci/plugin-docker-buildx:2
