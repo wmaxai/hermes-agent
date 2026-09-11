@@ -39,6 +39,11 @@ clone:
 steps:
   - name: build-and-push
     image: woodpeckerci/plugin-docker-buildx:2
+    # Woodpecker 3.x 起 plugin-docker-buildx 不再默认特权：linter 会直接拒绝
+    # 未声明 privileged 的 docker-buildx step（除非 server 的
+    # WOODPECKER_PLUGINS_PRIVILEGED 白名单里含该镜像）。显式声明后
+    # ① 配置校验通过 ② 插件才能以内置 dockerd 的特权模式启动。
+    privileged: true
     settings:
       registry: https://registry.group.wmaxai.team
       repo: registry.group.wmaxai.team/hermes-agent
