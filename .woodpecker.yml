@@ -6,8 +6,8 @@
 #
 # 触发：仅 stable 分支手动 Run（event=manual；branch=stable，其它分支/事件匹配不到）
 # 产出：registry.group.wmaxai.team/hermes-agent，tag 二选一（不是叠加别名）：
-#         stable-<commit 短 id>-<版本>   ← 版本取工作区 pyproject.toml 的 project.version
-#         stable-<commit 短 id>          ← 取不到版本时退化
+#         stable-<commit 短 id>-<最近 git tag>   ← 例：stable-fe20004118-20260911
+#         stable-<commit 短 id>                  ← 没有可达 tag 时退化
 #       ⚠️ 为什么不只打 stable-<版本>（或裸 stable）：k8s 用 tag 引用 + imagePullPolicy，
 #          同名 tag 即"最新内容"；同一版本号二次构建会在 Pod 重启时静默换掉内容。
 #          带 sha 的 tag 才与内容一一对应，回滚也说得清是哪一版（与 fns 同规则）。
@@ -37,22 +37,39 @@ clone:
   - name: clone
     image: woodpeckerci/plugin-git
     settings:
-      # 版本号从工作区的 pyproject.toml 读（git tag/history 都不需要），provenance 走
-      # HERMES_GIT_SHA build-arg，镜像构建不需要历史：本仓库 .git 有 1.2G，depth 1
-      # 省掉全量 clone（fns 那边为了 git describe 取版本才要 tags + depth 0）。
-      depth: 1
+      # 与 fns 同做法：非 tag 事件默认 `git fetch --no-tags`，工作区没有 tag，
+      # `git describe --tags --abbrev=0` 就取不到版本号 → tags: true 让 clone 把 tag 带回来。
+      # depth: 0（全量历史）才能让 describe 回溯到最近的可达 tag；代价是本仓库 .git 约 1.3G，
+      # 且 tags 一旦开启，plugin-git 的 partial 克隆也会关闭（见 plugin-git docs.md）。
+      tags: true
+      depth: 0
 
 steps:
-  # 生成镜像 tag 到工作区 .tags，下一步 tags_file 读取。与 fns 同规则：tag 必带 sha，
-  # 版本只做可读性后缀；命令用 cut 而不是 ${VAR:0:8}，不依赖具体 /bin/sh 实现。
+  # 算镜像 tag 并写进工作区 .tags（下一步 tags_file 读取）。
+  # fns 是在它自己的 build 步骤里算的；hermes 的 build 是 buildx 插件（没有 shell），
+  # 所以单列这一个只需要 git 的轻量步骤，镜像复用 clone 那一个（agent 上已拉取，无额外成本）。
   - name: version-tag
-    image: alpine:3.20
+    image: woodpeckerci/plugin-git
     commands:
-      - VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' pyproject.toml | head -1)
-      - SHA8=$(printf '%s' "$CI_COMMIT_SHA" | cut -c1-8)
-      - TAG="stable-${SHA8}${VERSION:+-$VERSION}"
+      # 版本 = 最近可达的 git tag（例：20260911），与 fns 完全一致的取法。
+      - VERSION=$(git describe --tags --abbrev=0 2>/dev/null | tr '+' '-' || true)
+      # 短 sha 与 fns 同写法：`${CI_COMMIT_SHA:0:8}` 由 Woodpecker 在【配置期】替换成值
+      # （实测 drone/envsubst v1.0.3：`${CI_COMMIT_SHA:0:8}` → `abcdef12`，`:0:8` 子串语法可用）。
+      - SHA8=${CI_COMMIT_SHA:0:8}
+      # 兜底：配置期变量为空时（例如创建 manual pipeline 时 forge API 限流、拿不到 branch head，
+      # commit sha 为空 → setNonEmptyEnvVar 会跳过该变量）从工作区 HEAD 取，clone 出来的就是本次构建的 commit。
+      - '[ -n "$SHA8" ] || SHA8=$(git rev-parse HEAD | cut -c1-8)'
+      # 注意：这里**不能**写 `stable-${SHA8}...`——配置期替换会把未知变量 ${SHA8} 清空；
+      # 不带花括号的 $SHA8 才会留给运行时 shell（实测 drone/envsubst 只替换带花括号的变量引用；
+      # 反向注意：本文件里**不要**出现字面量“美元符号+花括号”的写法，连注释里都会让替换器报
+      # unable to parse variable name，整条流水线直接生成失败）。
+      - 'if [ -n "$VERSION" ]; then TAG="stable-$SHA8-$VERSION"; else TAG="stable-$SHA8"; fi'
       - echo "$TAG" > .tags
       - cat .tags
+      # 诊断（可删）：`$CI_COMMIT_SHA` 不带花括号 → 看运行时环境；`${CI_COMMIT_SHA}` 花括号 →
+      # 已被 Woodpecker 在配置期替换。两者都空就说明该 pipeline 没有 commit sha。
+      # 注意整条要用引号包起来：命令里有「冒号+空格」，不引会被 YAML 当成 map（配置直接解析失败）。
+      - 'echo "CI vars runtime_sha=[$CI_COMMIT_SHA] config_time_sha=[${CI_COMMIT_SHA}] branch=[$CI_COMMIT_BRANCH]"'
 
   - name: build-and-push
     image: woodpeckerci/plugin-docker-buildx:2
