@@ -4,12 +4,17 @@
 #      运行环境，不适合 CI；构建镜像本身（uv sync 8 个 extra + npm + Playwright
 #      Chromium + web/ui-tui 前端构建）已是最强的一致性校验。
 #
-# 触发：仅 stable 分支手动 Run（event=manual；其它分支/事件匹配不到）
-# 产出：registry.group.wmaxai.team/hermes-agent:stable-<commit 短 id>
-# 部署：不做自动部署。推送成功后人工取 digest 更新 k8s（与 fns 同流程）：
+# 触发：仅 stable 分支手动 Run（event=manual；branch=stable，其它分支/事件匹配不到）
+# 产出：registry.group.wmaxai.team/hermes-agent，tag 二选一（不是叠加别名）：
+#         stable-<commit 短 id>-<版本>   ← 版本取工作区 pyproject.toml 的 project.version
+#         stable-<commit 短 id>          ← 取不到版本时退化
+#       ⚠️ 为什么不只打 stable-<版本>（或裸 stable）：k8s 用 tag 引用 + imagePullPolicy，
+#          同名 tag 即"最新内容"；同一版本号二次构建会在 Pod 重启时静默换掉内容。
+#          带 sha 的 tag 才与内容一一对应，回滚也说得清是哪一版（与 fns 同规则）。
+# 部署：不做自动部署。推送成功后人工取 digest 更新 k3s（与 fns 同流程）：
 #       kubectl -n <ns> set image deploy/<hermes 部署名> \
 #         hermes=registry.group.wmaxai.team/hermes-agent@sha256:<digest>
-# 凭据：registry_username / registry_password（Woodpecker 组织级 Secrets，与 fns 共用）
+# 凭据：registry_username / registry_password（Woodpecker wmaxai 组织级 Secrets，与 fns 共用）
 #
 # ⚠️ 两个前置条件在 Woodpecker UI 侧，不在本文件里：
 #   1. 项目 Timeout 调到 120 分钟（默认 60m）——本镜像构建很重：SQLite 源码编译
@@ -32,11 +37,23 @@ clone:
   - name: clone
     image: woodpeckerci/plugin-git
     settings:
-      # .dockerignore 排除 .git，镜像 provenance 走 HERMES_GIT_SHA build-arg，
-      # 构建不需要任何历史；本仓库 .git 有 1.2G，depth 1 省掉全量 clone。
+      # 版本号从工作区的 pyproject.toml 读（git tag/history 都不需要），provenance 走
+      # HERMES_GIT_SHA build-arg，镜像构建不需要历史：本仓库 .git 有 1.2G，depth 1
+      # 省掉全量 clone（fns 那边为了 git describe 取版本才要 tags + depth 0）。
       depth: 1
 
 steps:
+  # 生成镜像 tag 到工作区 .tags，下一步 tags_file 读取。与 fns 同规则：tag 必带 sha，
+  # 版本只做可读性后缀；命令用 cut 而不是 ${VAR:0:8}，不依赖具体 /bin/sh 实现。
+  - name: version-tag
+    image: alpine:3.20
+    commands:
+      - VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' pyproject.toml | head -1)
+      - SHA8=$(printf '%s' "$CI_COMMIT_SHA" | cut -c1-8)
+      - TAG="stable-${SHA8}${VERSION:+-$VERSION}"
+      - echo "$TAG" > .tags
+      - cat .tags
+
   - name: build-and-push
     image: woodpeckerci/plugin-docker-buildx:2
     # Woodpecker 3.x 起 plugin-docker-buildx 不再默认特权：linter 会直接拒绝
@@ -48,7 +65,8 @@ steps:
       registry: https://registry.group.wmaxai.team
       repo: registry.group.wmaxai.team/hermes-agent
       dockerfile: Dockerfile
-      tags: stable-${CI_COMMIT_SHA:0:8}
+      # tags_file 覆盖 tags：读取上一步写在工作区的 .tags（多行=多 tag）
+      tags_file: .tags
       platforms: linux/amd64
       build_args:
         HERMES_GIT_SHA: "${CI_COMMIT_SHA}"
