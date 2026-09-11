@@ -6,8 +6,8 @@
 #
 # 触发：仅 stable 分支手动 Run（event=manual；branch=stable，其它分支/事件匹配不到）
 # 产出：registry.group.wmaxai.team/hermes-agent，tag 二选一（不是叠加别名）：
-#         stable-<commit 短 id>-<版本>   ← 版本取工作区 pyproject.toml 的 project.version
-#         stable-<commit 短 id>          ← 取不到版本时退化
+#         stable-<commit 短 id>-<最近 git tag>   ← 例：stable-fe20004118-20260911
+#         stable-<commit 短 id>                  ← 没有可达 tag 时退化
 #       ⚠️ 为什么不只打 stable-<版本>（或裸 stable）：k8s 用 tag 引用 + imagePullPolicy，
 #          同名 tag 即"最新内容"；同一版本号二次构建会在 Pod 重启时静默换掉内容。
 #          带 sha 的 tag 才与内容一一对应，回滚也说得清是哪一版（与 fns 同规则）。
@@ -37,19 +37,25 @@ clone:
   - name: clone
     image: woodpeckerci/plugin-git
     settings:
-      # 版本号从工作区的 pyproject.toml 读（git tag/history 都不需要），provenance 走
-      # HERMES_GIT_SHA build-arg，镜像构建不需要历史：本仓库 .git 有 1.2G，depth 1
-      # 省掉全量 clone（fns 那边为了 git describe 取版本才要 tags + depth 0）。
-      depth: 1
+      # 与 fns 同做法：非 tag 事件默认 `git fetch --no-tags`，工作区没有 tag，
+      # `git describe --tags --abbrev=0` 就取不到版本号 → tags: true 让 clone 把 tag 带回来。
+      # depth: 0（全量历史）才能让 describe 回溯到最近的可达 tag；代价是本仓库 .git 约 1.3G，
+      # 且 tags 一旦开启，plugin-git 的 partial 克隆也会关闭（见 plugin-git docs.md）。
+      tags: true
+      depth: 0
 
 steps:
-  # 生成镜像 tag 到工作区 .tags，下一步 tags_file 读取。与 fns 同规则：tag 必带 sha，
-  # 版本只做可读性后缀；命令用 cut 而不是 ${VAR:0:8}，不依赖具体 /bin/sh 实现。
+  # 算镜像 tag 并写进工作区 .tags（下一步 tags_file 读取）。
+  # fns 是在它自己的 build 步骤里算的；hermes 的 build 是 buildx 插件（没有 shell），
+  # 所以单列这一个只需要 git 的轻量步骤，镜像复用 clone 那一个（agent 上已拉取，无额外成本）。
   - name: version-tag
-    image: alpine:3.20
+    image: woodpeckerci/plugin-git
     commands:
-      - VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' pyproject.toml | head -1)
-      - SHA8=$(printf '%s' "$CI_COMMIT_SHA" | cut -c1-8)
+      # 版本 = 最近可达的 git tag（例：20260911），与 fns 完全一致的取法。
+      - VERSION=$(git describe --tags --abbrev=0 2>/dev/null | tr '+' '-' || true)
+      # sha 直接从工作区取，而不是 `${CI_COMMIT_SHA:0:8}`：manual 事件下 CI_COMMIT_SHA 可能是
+      # 空的（实测跑出过 `stable--0.21.1`），而 clone 出来的 HEAD 就是本次构建的 commit。
+      - SHA8=$(git rev-parse HEAD | cut -c1-8)
       - TAG="stable-${SHA8}${VERSION:+-$VERSION}"
       - echo "$TAG" > .tags
       - cat .tags
