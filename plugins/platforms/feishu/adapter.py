@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import concurrent.futures
+import contextvars
 import hashlib
 import hmac
 import itertools
@@ -1980,8 +1981,11 @@ class FeishuAdapter(BasePlatformAdapter):
         loop = self._loop
         if not self._loop_accepts_callbacks(loop):
             if self._enqueue_pending_inbound_event(data):
+                # Replayed events hop onto the loop from THIS thread's context; keep the WS thread's
+                # profile scope (see _connect_websocket) rather than starting from an empty one.
                 threading.Thread(
-                    target=self._drain_pending_inbound_events, name="feishu-pending-inbound-drainer", daemon=True,
+                    target=contextvars.copy_context().run, args=(self._drain_pending_inbound_events,),
+                    name="feishu-pending-inbound-drainer", daemon=True,
                 ).start()
             return
         self._submit_on_loop(loop, self._handle_message_event_data(data))
@@ -3799,8 +3803,23 @@ class FeishuAdapter(BasePlatformAdapter):
             # Without the "channel" UA tag Feishu won't push group @mention events over WS.
             extra_ua_tags=["channel"],
         )
+        # The lark SDK owns this thread and fires every event/card callback on it; those hop back
+        # to the adapter loop via run_coroutine_threadsafe, which copies the CALLER's context — so
+        # whatever scope the WS thread carries is what pre-handler work (inbound media caching,
+        # .update_response marker, reactions env, drive comments) runs under. A bare executor
+        # thread has an empty context = launch profile. connect() runs inside the profile scope
+        # under multiplex (and the supervisor task inherits it), so snapshot it here.
+        #
+        # Run it on the adapter-owned pool, never the loop's default executor: this call runs
+        # run_forever() for the whole connection lifetime, so it pins one worker per app and the
+        # shared min(32, cpu+4) workers exhaust on a small host — the 7th multiplexed app's
+        # connect() then deadlocks at boot (2026-09-03 hang; see _get_ws_executor).
+        # ``None`` (the loop default) stays the fallback for stub/partial adapters that never
+        # built the pool, so behaviour is unchanged where the helper is absent.
+        _ws_pool = getattr(self, "_get_ws_executor", None)
         self._ws_future = loop.run_in_executor(
-            self._get_ws_executor(),
+            _ws_pool() if callable(_ws_pool) else None,
+            contextvars.copy_context().run,
             _run_official_feishu_ws_client,
             self._ws_client,
             self,

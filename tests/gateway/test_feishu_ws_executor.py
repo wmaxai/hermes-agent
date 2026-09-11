@@ -81,21 +81,36 @@ async def test_ws_client_runs_on_owned_pool_not_default():
 
 def _run_in_executor_is_owned(source: str) -> bool:
     """True iff the first positional arg to run_in_executor in this body
-    references the owned pool rather than None."""
+    resolves to the owned pool rather than the loop default (None).
+
+    The expression is allowed to be a local captured from ``_get_ws_executor``
+    (``_ws_pool() if callable(_ws_pool) else None``) so upstream's profile-scope
+    context snapshot can ride along as additional arguments.
+    """
     import re
 
-    call = re.search(r"run_in_executor\(\s*([^,\n]+),", source)
+    call = re.search(r"run_in_executor\(\s*(.+?),\n", source, re.S)
     if not call:
         return False
     first = call.group(1).strip()
-    return "_get_ws_executor" in first and first != "None"
+    # A bare ``None`` is the regression (loop default executor); an owned expression may still
+    # contain ``None`` as its fallback for stub adapters, e.g. ``_ws_pool() if ... else None``.
+    if first == "None":
+        return False
+    return "_get_ws_executor" in first or "_ws_pool" in first
 
 
 def test_connect_websocket_submits_to_owned_pool():
     """Guard against regressing #73779 back onto the default executor."""
-    assert _run_in_executor_is_owned(inspect.getsource(FeishuAdapter._connect_websocket)), (
+    body = inspect.getsource(FeishuAdapter._connect_websocket)
+    assert _run_in_executor_is_owned(body), (
         "_connect_websocket must submit the WS client to _get_ws_executor(), "
         "not the loop default executor (None)"
+    )
+    # Upstream 2952dc62bc ("WS-thread callbacks run under their own profile") must survive the
+    # merge: the WS thread has to carry the connecting profile's contextvars snapshot.
+    assert "contextvars.copy_context().run" in body, (
+        "_connect_websocket must keep upstream's contextvars snapshot on the WS submission"
     )
 
 
