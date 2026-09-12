@@ -100,6 +100,27 @@ pending → running → completed | failed
 
 `gateway/shutdown_flush.py`：关机前把 `_pending_messages` 和 agent 历史原子写入 `<hermes_home>/pending_messages/`，重启后 `recover_pending_to_db` 回放进 DB。
 
+#### 2.1.5 `hosted_rooms` 的复制与 epoch 接管机制（重要参考实现）
+
+除租约外，Hermes 还有第二套多实例协调机制，实现在 `gateway/hosted_room_replicas.py`（**官方实现，非 hack**）：
+
+| 能力 | 实现 |
+|---|---|
+| 状态复制 | `ingest_page()` —— 分页拉取房间日志，**幂等、防缺口、防 epoch 回退** |
+| 故障接管 | `promote_replica()` —— 在 `epoch + 1` 上恢复，写入 `authority.claimed` 事件作为血统证明 |
+| 防脑裂 | `demote_room()` —— 旧权威看到更新 epoch 时记录 `authority.lost` 并降级 |
+| 版本化 | **`authority_epoch`** —— 每次接管 +1（即 fencing token 的官方实现） |
+
+**两个重要结论**：
+
+1. **不需要自定义 fencing token** —— 官方已有 `authority_epoch` 机制，且覆盖了"旧权威回归"这个最难场景。改造时应**参考它而非自造**。
+2. **同步是拉模式（pull），不是推模式（push）** —— 副本主动按序列拉日志页，**不需要 Redis/Valkey 这类广播中间件**。这正是 Hermes 与 FNS 在基础设施需求上的根本差异（见 3.0）。
+
+**适用范围说明**：`hosted_rooms` 服务于**群聊房间**场景；普通单会话走的是租约机制（2.1.1）。**两套机制并存**：
+
+- **普通会话** → 租约（互斥，active/standby 语义）
+- **群聊房间** → 复制 + epoch 接管（多副本高可用语义）
+
 ### 2.2 租约机制的历史与定位（决定了它为什么只跑 SQLite）
 
 从 git 历史可查：`19527db731 fix(gateway): per-session turn lease + conversation-scope funnel (#64934) (#67401)`
@@ -228,6 +249,41 @@ pending → running → completed | failed
 - 理由：`config_env.py` 的 provider 发现逻辑会**跨 profile 扫描 `.env`**，同一 pod 内的 bot 必须共享 `HERMES_HOME`；且现有 `state.db` 是**单一账本**，打散会导致账本/会话/技能沉淀全部分裂
 - 分组方式：在 `wmaxai-agents` 仓按目录组织（如 `groups/<业务线>/`），initContainer 按环境变量指定的分组铺开 profile
 
+### 3.6 codex 隔离：必须指定 `CODEX_HOME`
+
+**问题**：`codex-sdk` 插件拉起 codex 子进程时**不设 `CODEX_HOME`**（源码 `plugins/codex-sdk/__init__.py` 用 `os.environ.copy()`），子进程因此读取默认的 `~/.codex`，与宿主机上可能存在的 codex CLI **共用同一份配置与状态库**。
+
+**后果**：插件与 CLI 的 `config.toml`、rollout DB、auth 互相污染（本机已实测确认二者共用同一状态库）。
+
+**改造方案**：让插件显式注入 `CODEX_HOME`（如 `HERMES_HOME/codex-home/`），使 codex 配置、state、rollout 全部落在 Hermes 自己的目录内。
+
+**收益**：
+- codex 配置、state、rollout、auth 全部与外部 CLI 隔离
+- 容器化后天然成立（pod 内 `~/.codex` 本就是 pod 私有），但**显式指定更干净**，且能避免与镜像内其他工具冲突
+
+**注意**：若容器内直接使用 pod 的 `~/.codex`，需保证 `model_reasoning_effort` 等设置随镜像或 ConfigMap 提供。
+
+### 3.7 多端同步（未来需求，当前未触发）
+
+**现状**：Hermes 支持多端接入同一 agent，实测会话来源分布为 `feishu: 23 / cli: 4 / cron: 1`，`handoff_state` 状态机具备但**全部未使用**（28 个会话均为 `None`）。
+
+**两个层次**：
+
+| 层次 | 语义 | 现状 |
+|---|---|---|
+| 会话切换 | 同一会话从 A 端切到 B 端继续（`/resume`、CLI 续接） | **已实现**，租约正为此设计 |
+| **并发访问** | 用户同时在两端操作同一会话 | **需设计**——租约保证不并发执行，但"第二端的体验"是产品问题 |
+
+**如果要做多端实时同步**（如飞书与桌面同时观看一个正在跑的会话）：会话在 pod A 执行，桌面端连在 pod B，**pod B 需要获知 pod A 的实时输出**——这需要跨实例通知。
+
+**实现优先级（成本从低到高）**：
+
+1. **轮询 PG** —— 秒级延迟，零新组件
+2. **PG `LISTEN/NOTIFY`** —— 实时，仍不需要新组件
+3. Redis Pub/Sub —— 实时，但引入新组件（**不推荐**，前两者已够）
+
+**结论**：即使未来做多端同步，**仍然不需要 Redis**。当前无此场景，列为未来需求。
+
 ---
 
 ## 4. 改造清单（按优先级）
@@ -335,7 +391,11 @@ WHERE session_turn_leases.expires_at <= $3        -- 已过期才可抢
 
 按 3.2 的方案，实现"入站即落库 + 排队消费"。现有 `async_delegations` 表与 `_pending_messages` 机制是地基。
 
-#### 4.8 可观测性
+#### 4.8 指定 `CODEX_HOME` 隔离 codex 运行时
+
+按 3.6，让插件显式注入 `CODEX_HOME`，使 codex 的配置/state/rollout/auth 落在 Hermes 自己的目录内，与外部 codex CLI 彻底隔离。
+
+#### 4.9 可观测性
 
 - 租约表增加定期清理（清理长期过期记录）
 - 暴露指标：租约抢占成功率、平均等待时长、接管次数、TTL 超时次数
@@ -414,11 +474,23 @@ WHERE session_turn_leases.expires_at <= $3        -- 已过期才可抢
 **目标**：在不改生产代码的前提下，验证"两个实例共享状态"端到端可行。
 
 1. 复制一份 `HERMES_HOME` 到沙箱（`HERMES_HOME` 环境变量已实测生效）
-2. 两个网关进程指向**同一个 PG 实例**（把租约表手工迁过去，或先用共享 SQLite 验证）
+2. 两个网关进程指向**同一个 PG 实例**（或先用共享 SQLite 验证租约语义）
 3. 对同一 bot 并发发两条消息，观察：
    - 第二个是**被正确挡住**还是双跑
    - 会话历史是否一致
    - 故障注入（kill 一个实例）后另一个能否接管
+
+**验收项（含 10.2 的压缩链清理项，必须一并覆盖）**：
+
+| # | 验收项 | 判据 |
+|---|---|---|
+| 1 | 跨实例互斥 | 同一会话并发时，第二个被正确挡住 |
+| 2 | 故障接管 | kill 实例后，另一实例在 TTL 内接管 |
+| 3 | 会话历史一致性 | 接管后历史完整，无重复写入 |
+| 4 | **孤儿父会话** | 清理后不存在 `parent_session_id` 指向已删除会话的行 |
+| 5 | **谱系完整性** | 压缩链祖先链可完整上溯到根，无断裂 |
+| 6 | **租约键一致性** | 清理前后 `conversation_id`（血统根）解析一致 |
+| 7 | **活跃会话不受清理** | 进行中（非 ENDED）会话及其压缩链整体保留 |
 
 **这一步不动生产，风险可控，结论是二元的。**
 
@@ -426,8 +498,13 @@ WHERE session_turn_leases.expires_at <= $3        -- 已过期才可抢
 
 1. 引入 DB 抽象层，收敛 `sqlite3` 直接调用
 2. PG backend 实现（含迁移脚本、FTS 方案）
-3. fencing token
-4. TTL / fail-mode 参数化
+3. 移除 `_compression_lock_holder_process_is_dead` 的本地 PID 分支（跨机失效且危险）
+4. TTL（300s → 60s）/ fail-mode（open → closed）参数化
+5. 指定 `CODEX_HOME`（3.6）
+6. 思考链不落库（10.3）
+7. `retention_days` 改为 7（10.2）
+
+> 注：**不需要自定义 fencing token**——官方 `hosted_rooms` 已有 `authority_epoch` 机制可参考（2.1.5）。
 
 ### 阶段 3：部署验证
 
