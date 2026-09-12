@@ -288,6 +288,151 @@ pending → running → completed | failed
 
 ## 4. 改造清单（按优先级）
 
+### 4.0 总纲：数据库后端适配器（最关键落地方案）
+
+> **本章是整个改造的架构方向，其余 P0 项均从属于它。**
+
+#### 4.0.1 设计原则（参照 FNS）
+
+**PG 只是数据库的一种可扩展选项，不能影响 SQLite 的默认地位。**
+
+| 原则 | 要求 |
+|---|---|
+| **默认 SQLite** | 不配置时行为与现状**完全一致**，现有部署零影响 |
+| **PG 可选** | 通过配置开启，用于多实例部署场景 |
+| **统一适配器** | 所有使用 SQLite 的地方**都通过适配器**，按配置的数据库类型执行对应操作 |
+| **包一层，不重写** | 改造是**在现有 SQLite 逻辑外包裹抽象层**，不修改其行为 |
+
+**参照 FNS 的配置形态**（`fast-note-sync-service/config/config.yaml`）：
+
+```yaml
+database:
+  type: sqlite        # sqlite | mysql | postgres，默认 sqlite
+  path: ...           # sqlite 专用
+  host/port/username/password/name   # 网络库专用
+  ssl-mode / schema / table-prefix   # 按类型生效
+```
+
+**Hermes 应对齐同一形态**：新增 `database.type: sqlite | postgres`（默认 `sqlite`），其余连接参数按类型生效。
+
+#### 4.0.2 现有代码的改造切入点（已核实）
+
+**好消息：`SessionDB` 已经把 DB 访问收敛到了少数入口**（`hermes_state.py`）：
+
+| 方法 | 行号 | 作用 |
+|---|---|---|
+| `_read_ctx()` | 739 | 读上下文（连接获取） |
+| `_execute_write()` | 799 | 写执行（**已带 `patience_s` 重试**，PG 版可复用做连接重试） |
+| `_read_one()` | 932 | 单行读 |
+
+**这三个方法是天然的适配器插入点**——**不需要散改 581 处 `sqlite3` 调用**，只要在它们下面接一层 backend 分派。
+
+#### 4.0.3 改造难点（如实评估）
+
+**难点一：连接创建点分散在独立模块**（不走 `SessionDB`）：
+
+```
+gateway/delivery_ledger.py:148
+gateway/hosted_rooms_common.py:99,119
+gateway/hosted_rooms.py:970
+gateway/lifecycle_ledger.py:179
+gateway/readiness.py:32
+gateway/hosted_room_policy_checkpoint.py:115
+```
+
+这些模块**各自建连接、各自写 SQL**。若不纳入适配器，PG 模式下它们会去连不存在的 SQLite 文件。
+
+**难点二：SQLite 专有逻辑无法转换，只能跳过**。`hermes_state_dbfile.py` 含大量 WAL 管理、fd 追踪、文件级探针（如"第二个打开者不能创建替换 WAL inode"）。这些在 PG 下**完全不适用**，需整块条件跳过。
+
+**难点三：SQL 方言差异**。`INSERT OR REPLACE`、`PRAGMA`、`AUTOINCREMENT`、`last_insert_rowid()`、`strftime()` 等均需按 backend 分支。
+
+#### 4.0.4 目标架构
+
+```
+配置: database.type: sqlite | postgres   (默认 sqlite)
+         │
+         ▼
+  ┌─────────────────────────────┐
+  │  DB Backend 抽象层           │
+  │  - connect()                │  ← 各模块统一从此获取连接
+  │  - execute() / executemany()│
+  │  - 事务语义 (with 语句)      │
+  │  - 方言转换 (占位符/函数)     │
+  └──────────┬──────────────────┘
+             │
+      ┌──────┴──────┐
+      ▼             ▼
+  SQLiteBackend  PostgresBackend
+  (现有逻辑)      (新增)
+```
+
+#### 4.0.5 改动清单
+
+| # | 改动项 | 说明 |
+|---|---|---|
+| 1 | **新增 `database.type` 配置项** | `sqlite \| postgres`，**默认 sqlite** |
+| 2 | **抽象连接层** | 统一 `connect()` 入口，替换所有 `sqlite3.connect` 调用点（含 4.0.3 的独立模块） |
+| 3 | **抽象执行层** | 统一 `execute`/`executemany`/事务，收敛 `_read_ctx`/`_execute_write`/`_read_one` |
+| 4 | **方言适配** | 占位符（`?` → `%s`）、`INSERT OR REPLACE`、`PRAGMA`、`last_insert_rowid()`、时间函数 |
+| 5 | **SQLite 专有逻辑条件化** | WAL / fd 追踪 / 文件探针等仅在 sqlite backend 下执行 |
+| 6 | **独立模块接入** | `delivery_ledger`、`hosted_rooms_common`、`hosted_rooms`、`lifecycle_ledger`、`readiness`、`hosted_room_policy_checkpoint` |
+| 7 | **Schema 与迁移** | 两套 DDL（含 FTS5 → PG 全文检索方案，见 4.4） |
+| 8 | **默认行为回归验证** | **不配置时行为与现状完全一致**——必须作为独立验收项 |
+
+#### 4.0.6 与其余改造项的关系
+
+| 改造项 | 与适配器的关系 |
+|---|---|
+| 4.1 租约表迁 PG | **在适配器内实现**——同样的 SQL 语义，按 backend 生成不同方言 |
+| 4.2 消息持久化迁 PG | **同上**，受益于执行层收敛 |
+| 4.3 PG 高可用 | 部署前提，与适配器无关 |
+| 4.4 FTS 方案 | **属于 Schema 层**，按 backend 提供两套实现 |
+| 4.5 TTL / 4.6 fail-mode | 参数化，与 backend 无关 |
+
+**一句话**：**适配器是"怎么做"，前面几节讨论的是"做什么"和"为什么"。**
+
+#### 4.0.7 配置形态（对齐 FNS）
+
+**主配置文件新增**（位置与现有 `state` 配置块并列）：
+
+```yaml
+database:
+  # 数据库类型：sqlite | postgres
+  # 默认 sqlite；PG 用于多实例部署
+  type: sqlite
+  # --- sqlite 专用 ---
+  path: ~/.hermes/state.db
+  # --- postgres 专用 ---
+  host: localhost
+  port: 5432
+  username: hermes
+  password: ${HERMES_DB_PASSWORD}
+  name: hermes
+  ssl-mode: disable
+  schema: public
+  # 连接池
+  pool-size: 5
+  # 备用库（多实例故障转移，见 4.3）
+  standby-host: ""
+  standby-port: 5432
+```
+
+**关键约束**：
+
+1. **不配置 `database` 块时，行为与现状完全一致**——这是硬性要求
+2. 密码走环境变量/secret，**不落配置文件明文**
+3. `type` 的值域与 FNS 对齐，便于运维心智统一
+
+#### 4.0.8 验收要求
+
+**必须把"默认行为不变"作为独立验收项**（对应第 7 节验收项 8、9）：
+
+1. **回归验证**：不配置 `database.type` 时，全部功能行为与改造前逐项一致
+2. **覆盖完整性**：PG 模式下，**没有任何模块直连 SQLite 文件**（可用文件句柄/连接追踪验证）
+3. **切换验证**：同一份数据，`type: sqlite` 与 `type: postgres` 两种配置下功能等价
+
+**为什么这条最重要**：现有 16 个 bot 跑在 SQLite 上，**改造不能引入任何风险**——PG 是"想用时才用"的选项，不是"必须迁移"的负担。
+
 ### P0：必须做
 
 #### 4.1 租约表迁 PostgreSQL
@@ -480,7 +625,7 @@ WHERE session_turn_leases.expires_at <= $3        -- 已过期才可抢
    - 会话历史是否一致
    - 故障注入（kill 一个实例）后另一个能否接管
 
-**验收项（含 10.2 的压缩链清理项，必须一并覆盖）**：
+**验收项（含 4.0.8 适配器回归与 10.2 压缩链清理项，必须一并覆盖）**：
 
 | # | 验收项 | 判据 |
 |---|---|---|
@@ -491,6 +636,8 @@ WHERE session_turn_leases.expires_at <= $3        -- 已过期才可抢
 | 5 | **谱系完整性** | 压缩链祖先链可完整上溯到根，无断裂 |
 | 6 | **租约键一致性** | 清理前后 `conversation_id`（血统根）解析一致 |
 | 7 | **活跃会话不受清理** | 进行中（非 ENDED）会话及其压缩链整体保留 |
+| 8 | **默认 SQLite 行为回归** | 不配置 `database.type` 时，行为与改造前**逐项一致**（4.0.8） |
+| 9 | **适配器覆盖完整性** | PG 模式下无任何模块直连 SQLite 文件 |
 
 **这一步不动生产，风险可控，结论是二元的。**
 
