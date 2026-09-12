@@ -315,7 +315,73 @@ database:
 
 **Hermes 应对齐同一形态**：新增 `database.type: sqlite | postgres`（默认 `sqlite`），其余连接参数按类型生效。
 
-#### 4.0.2 现有代码的改造切入点（已核实）
+#### 4.0.2 边界切分：业务逻辑 vs SQLite 专有（核心方法）
+
+**改造的本质不是"逐处替换 sqlite3 调用"，而是按边界切分：把业务逻辑与 SQLite 专有实现分离，适配层正好落在切缝上。**
+
+##### 边界判据
+
+| 类别 | 判定特征 | 归属 |
+|---|---|---|
+| **SQLite 专有** | WAL / `PRAGMA` / fd+inode / `fcntl` / `VACUUM` / `journal_mode` / `synchronous` / `INSERT OR REPLACE` / `AUTOINCREMENT` / `last_insert_rowid` / `row_factory` / `isolation_level` / `mode=ro` / `:memory:` / `check_same_thread` | **适配层内部实现**，业务侧不可见 |
+| **业务逻辑** | `SELECT` / `INSERT INTO` / `UPDATE` / `DELETE FROM` / 事务（BEGIN/COMMIT/ROLLBACK）/ DDL / `execute` / `fetch*` | **走适配层统一接口**，方言透明 |
+
+##### 实测分布（2026-09-12，全量扫描）
+
+**96 个文件含 `sqlite3`**，命中分布：
+
+| 类别 | 命中次数 | 主要构成 |
+|---|---|---|
+| **SQLite 专有** | **1,652** | WAL 507、PRAGMA 159、fd/inode 144、busy_timeout 133、journal_mode 100、row_factory 100、VACUUM 77、fcntl 73、sqlite_master 66、`INSERT OR REPLACE` 54 |
+| **业务逻辑** | **3,362** | `execute(` 1,242、`SELECT` 730、`fetch*` 525、`UPDATE` 352、`INSERT INTO` 139、`CREATE TABLE` 104、`DELETE FROM` 98、事务 90 |
+
+**业务侧与专有侧约为 2:1**，边界清晰可切。
+
+##### 三层处置策略
+
+**混杂文件 75/96，但按严重程度分三档，直接决定改造顺序：**
+
+**第一档：纯专有文件（PG 模式下不加载，零改造）**
+
+```
+hermes_cli/doctor_platform.py            (专有 20)
+hermes_state_errors.py                   (专有 18)
+gateway/session_transcript.py            (专有 2)
+gateway/kanban_watchers_dispatcher.py    (专有 1)
+```
+
+→ **条件短路，整体跳过。**
+
+**第二档：专有为主的文件（PG 模式下整体不加载）**
+
+```
+hermes_state_wal.py                      (专有 244 / 业务 23)
+hermes_cli/kanban_db_connect.py          (专有 131 / 业务 100)
+hermes_state_dbfile.py                   (专有 117 / 业务 12)
+hermes_state_repair.py                   (专有 145 / 业务 48)
+hermes_cli/backup.py                     (专有 83 / 14)
+```
+
+→ **这些是 SQLite 基础设施本身**（WAL 管理、fd 追踪、文件修复、备份），**PG 下整体不加载，而非逐行适配。**
+
+**第三档：业务为主的文件（真正的适配工作量）**
+
+```
+hermes_wisdom/store.py                   (专有 29 / 业务 343)
+hermes_cli/kanban_db.py                  (专有 21 / 业务 271)
+hermes_state_schema.py                   (专有 33 / 业务 171)
+gateway/hosted_rooms.py                  (专有 25 / 业务 160)
+hermes_state_messages.py                 (专有 10 / 业务 153)
+hermes_state_sessions.py                 (专有 1  / 业务 141)
+```
+
+→ **业务 SQL 占绝对多数**：改造 = **把 SQL 换成适配层调用**，少数专有点（`row_factory`、`timeout=`）由适配层内部处理。
+
+##### 额外收益
+
+**PG 模式下代码路径反而更简单**：`hermes_state_wal.py`（244 次专有命中）在 PG 下完全不需要——没有 WAL 管理、没有 fd 追踪、没有文件锁探测。**专有逻辑不是"要转换的负担"，而是"可以整块丢掉的包袱"。**
+
+#### 4.0.3 现有代码的改造切入点（已核实）
 
 **好消息：`SessionDB` 已经把 DB 访问收敛到了少数入口**（`hermes_state.py`）：
 
@@ -327,7 +393,7 @@ database:
 
 **这三个方法是天然的适配器插入点**——**不需要散改 581 处 `sqlite3` 调用**，只要在它们下面接一层 backend 分派。
 
-#### 4.0.3 改造难点（如实评估）
+#### 4.0.4 改造难点（如实评估）
 
 **难点一：连接创建点分散在独立模块**（不走 `SessionDB`）：
 
@@ -346,7 +412,7 @@ gateway/hosted_room_policy_checkpoint.py:115
 
 **难点三：SQL 方言差异**。`INSERT OR REPLACE`、`PRAGMA`、`AUTOINCREMENT`、`last_insert_rowid()`、`strftime()` 等均需按 backend 分支。
 
-#### 4.0.4 目标架构
+#### 4.0.5 目标架构
 
 ```
 配置: database.type: sqlite | postgres   (默认 sqlite)
@@ -366,7 +432,7 @@ gateway/hosted_room_policy_checkpoint.py:115
   (现有逻辑)      (新增)
 ```
 
-#### 4.0.5 改动清单
+#### 4.0.6 改动清单
 
 | # | 改动项 | 说明 |
 |---|---|---|
@@ -379,7 +445,7 @@ gateway/hosted_room_policy_checkpoint.py:115
 | 7 | **Schema 与迁移** | 两套 DDL（含 FTS5 → PG 全文检索方案，见 4.4） |
 | 8 | **默认行为回归验证** | **不配置时行为与现状完全一致**——必须作为独立验收项 |
 
-#### 4.0.6 与其余改造项的关系
+#### 4.0.7 与其余改造项的关系
 
 | 改造项 | 与适配器的关系 |
 |---|---|
@@ -391,7 +457,7 @@ gateway/hosted_room_policy_checkpoint.py:115
 
 **一句话**：**适配器是"怎么做"，前面几节讨论的是"做什么"和"为什么"。**
 
-#### 4.0.7 配置形态（对齐 FNS）
+#### 4.0.8 配置形态（对齐 FNS）
 
 **主配置文件新增**（位置与现有 `state` 配置块并列）：
 
@@ -423,7 +489,7 @@ database:
 2. 密码走环境变量/secret，**不落配置文件明文**
 3. `type` 的值域与 FNS 对齐，便于运维心智统一
 
-#### 4.0.8 验收要求
+#### 4.0.9 验收要求
 
 **必须把"默认行为不变"作为独立验收项**（对应第 7 节验收项 8、9）：
 
